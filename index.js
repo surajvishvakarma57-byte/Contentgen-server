@@ -13,7 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_change_this";
 
-app.use(cors({ origin: "http://localhost:5173", credentials: true }));
+app.use(cors({ origin: "*", credentials: false }));
 app.use(express.json());
 
 // ─── JSON Database ────────────────────────────────────────────────────────────
