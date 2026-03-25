@@ -307,31 +307,57 @@ app.post("/api/generate-image", requireAuth, async (req, res) => {
   if (!process.env.GEMINI_API_KEY)
     return res.status(500).json({ error: "GEMINI_API_KEY not set" });
 
-  try {
-    const styleMap = {
-      blog: "professional blog hero photo, high quality, realistic",
-      instagram: "vibrant aesthetic instagram photo, colorful, lifestyle",
-      linkedin: "professional business photo, clean corporate",
-      twitter: "bold eye-catching social media image",
-      email: "clean minimal email header banner",
-      marketing: "commercial advertisement photo, bold colors",
-    };
-    const style = styleMap[platform] || "high quality professional photo";
-    const imagePrompt = `${prompt}, ${style}, no text, no watermark, photorealistic`;
+  const styleMap = {
+    blog: "professional blog hero photo, high quality, realistic",
+    instagram: "vibrant aesthetic instagram photo, colorful, lifestyle",
+    linkedin: "professional business photo, clean corporate",
+    twitter: "bold eye-catching social media image",
+    email: "clean minimal email header banner",
+    marketing: "commercial advertisement photo, bold colors",
+  };
+  const style = styleMap[platform] || "high quality professional photo";
+  const imagePrompt = `${prompt}, ${style}, no text, no watermark, photorealistic`;
 
+  // Try Gemini Imagen first
+  try {
     const response = await ai.models.generateImages({
       model: "imagen-3.0-generate-002",
       prompt: imagePrompt,
       config: { numberOfImages: 1, outputMimeType: "image/jpeg" },
     });
-
     const imageData = response.generatedImages?.[0]?.image?.imageBytes;
-    if (!imageData) return res.status(500).json({ error: "No image generated" });
+    if (imageData) {
+      console.log("✓ Imagen generated successfully");
+      return res.json({ image: imageData, mimeType: "image/jpeg", source: "imagen" });
+    }
+  } catch (imagenErr) {
+    console.log("⚠ Imagen not available:", imagenErr.message, "— falling back to Gemini Vision");
+  }
 
-    res.json({ image: imageData, mimeType: "image/jpeg" });
-  } catch (err) {
-    console.error("❌ Image generation error:", err.message);
-    res.status(500).json({ error: err.message || "Image generation failed" });
+  // Fallback: Use Gemini to describe an image, then fetch from Picsum with a consistent seed
+  try {
+    // Use Gemini to extract the best search keywords for the image
+    const kwResult = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: `Give me 2-3 single English words (comma separated, no explanation) that best describe a photo for this content: "${prompt}". Example: "mountain,hiking,adventure"`,
+    });
+    const keywords = (kwResult.text || "").trim().replace(/[^a-z0-9,]/gi, "").toLowerCase();
+    console.log("✓ Fallback keywords:", keywords);
+
+    // Fetch image from Picsum as base64 via the server (avoids Android network issues)
+    const seed = Math.abs(prompt.split("").reduce((a, c) => a + c.charCodeAt(0), 0)) % 1000;
+    const imgRes = await fetch(`https://picsum.photos/seed/${seed}/800/450`);
+    if (!imgRes.ok) throw new Error("Picsum fetch failed");
+
+    const arrayBuffer = await imgRes.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString("base64");
+    const mimeType = imgRes.headers.get("content-type") || "image/jpeg";
+
+    console.log("✓ Picsum fallback image fetched");
+    return res.json({ image: base64, mimeType, source: "picsum" });
+  } catch (fallbackErr) {
+    console.error("❌ All image methods failed:", fallbackErr.message);
+    res.status(500).json({ error: "Image generation failed: " + fallbackErr.message });
   }
 });
 
