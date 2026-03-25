@@ -299,6 +299,42 @@ app.post("/api/generate", requireAuth, async (req, res) => {
   }
 });
 
+
+// ── POST /api/generate-image ──────────────────────────────────────────────────
+app.post("/api/generate-image", requireAuth, async (req, res) => {
+  const { prompt, platform = "blog" } = req.body;
+  if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
+  if (!process.env.GEMINI_API_KEY)
+    return res.status(500).json({ error: "GEMINI_API_KEY not set" });
+
+  try {
+    const styleMap = {
+      blog: "professional blog hero photo, high quality, realistic",
+      instagram: "vibrant aesthetic instagram photo, colorful, lifestyle",
+      linkedin: "professional business photo, clean corporate",
+      twitter: "bold eye-catching social media image",
+      email: "clean minimal email header banner",
+      marketing: "commercial advertisement photo, bold colors",
+    };
+    const style = styleMap[platform] || "high quality professional photo";
+    const imagePrompt = `${prompt}, ${style}, no text, no watermark, photorealistic`;
+
+    const response = await ai.models.generateImages({
+      model: "imagen-3.0-generate-002",
+      prompt: imagePrompt,
+      config: { numberOfImages: 1, outputMimeType: "image/jpeg" },
+    });
+
+    const imageData = response.generatedImages?.[0]?.image?.imageBytes;
+    if (!imageData) return res.status(500).json({ error: "No image generated" });
+
+    res.json({ image: imageData, mimeType: "image/jpeg" });
+  } catch (err) {
+    console.error("❌ Image generation error:", err.message);
+    res.status(500).json({ error: err.message || "Image generation failed" });
+  }
+});
+
 app.get("/api/content", requireAuth, (req, res) => {
   const { type, search, limit = 50, offset = 0 } = req.query;
   res.json(db.getContent({ type, search, limit: parseInt(limit), offset: parseInt(offset), userId: req.userId }));
