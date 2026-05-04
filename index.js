@@ -3,7 +3,6 @@ import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { GoogleGenAI } from "@google/genai";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { readFileSync, writeFileSync, existsSync } from "fs";
@@ -12,10 +11,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_change_this";
+const GROQ_KEY = process.env.GROQ_API_KEY || "";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+// Use a fast Groq model — llama-3.3-70b-versatile is excellent and fast
+const GROQ_MODEL = "llama-3.3-70b-versatile";
 
 app.use(cors({ origin: "*", credentials: false }));
 app.use(express.json());
 
+// ─── JSON Database ────────────────────────────────────────────────────────────
 const DB_PATH = join(__dirname, "content-db.json");
 
 function loadDB() {
@@ -39,6 +43,7 @@ function saveDB(data) {
   writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
 }
 
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
 function makeToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
 }
@@ -56,7 +61,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-// Register
+// ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 app.post("/api/auth/register", async (req, res) => {
   const { name, email, password } = req.body;
   if (!name || !email || !password)
@@ -76,7 +81,6 @@ app.post("/api/auth/register", async (req, res) => {
   res.json({ token, user: safeUser });
 });
 
-// Login
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password)
@@ -91,7 +95,6 @@ app.post("/api/auth/login", async (req, res) => {
   res.json({ token, user: safeUser });
 });
 
-// Get current user
 app.get("/api/auth/me", requireAuth, (req, res) => {
   const data = loadDB();
   const user = data.users.find((u) => u.id === req.userId);
@@ -100,7 +103,6 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
   res.json(safeUser);
 });
 
-// Update profile
 app.put("/api/auth/profile", requireAuth, async (req, res) => {
   const { name, email } = req.body;
   const data = loadDB();
@@ -108,7 +110,7 @@ app.put("/api/auth/profile", requireAuth, async (req, res) => {
   if (idx === -1) return res.status(404).json({ error: "User not found" });
   if (email && email.toLowerCase() !== data.users[idx].email) {
     const taken = data.users.find((u) => u.email === email.toLowerCase() && u.id !== req.userId);
-    if (taken) return res.status(409).json({ error: "Email already in use by another account" });
+    if (taken) return res.status(409).json({ error: "Email already in use" });
   }
   if (name) data.users[idx].name = name.trim();
   if (email) data.users[idx].email = email.toLowerCase().trim();
@@ -117,7 +119,6 @@ app.put("/api/auth/profile", requireAuth, async (req, res) => {
   res.json({ user: safeUser });
 });
 
-// Update password
 app.put("/api/auth/password", requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword)
@@ -134,7 +135,7 @@ app.put("/api/auth/password", requireAuth, async (req, res) => {
   res.json({ message: "Password updated successfully" });
 });
 
-// DB helpers — all scoped to userId
+// ─── DB helpers ───────────────────────────────────────────────────────────────
 const db = {
   insertContent(row) {
     const data = loadDB();
@@ -190,8 +191,7 @@ const db = {
       typeMap[i.type].count++;
       typeMap[i.type].words += i.word_count || 0;
     });
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const sixMonthsAgo = new Date(); sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
     const monthMap = {};
     content.filter((i) => new Date(i.created_at) >= sixMonthsAgo).forEach((i) => {
       const d = new Date(i.created_at);
@@ -201,8 +201,7 @@ const db = {
       monthMap[key].count++;
       monthMap[key].words += i.word_count || 0;
     });
-    const sixWeeksAgo = new Date();
-    sixWeeksAgo.setDate(sixWeeksAgo.getDate() - 42);
+    const sixWeeksAgo = new Date(); sixWeeksAgo.setDate(sixWeeksAgo.getDate() - 42);
     const weekMap = {};
     content.filter((i) => new Date(i.created_at) >= sixWeeksAgo).forEach((i) => {
       const d = new Date(i.created_at);
@@ -213,9 +212,7 @@ const db = {
       weekMap[week].words += i.word_count || 0;
       weekMap[week].count++;
     });
-    const topContent = [...content]
-      .sort((a, b) => (b.word_count || 0) - (a.word_count || 0))
-      .slice(0, 5)
+    const topContent = [...content].sort((a, b) => (b.word_count || 0) - (a.word_count || 0)).slice(0, 5)
       .map(({ id, title, type, word_count, char_count, created_at }) => ({ id, title, type, word_count, char_count, created_at }));
     const now = new Date();
     const d7 = new Date(now); d7.setDate(d7.getDate() - 7);
@@ -236,62 +233,126 @@ const db = {
   },
 };
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
-
-function buildPrompt(platform, tone, userPrompt) {
+// ─── Prompt builder ───────────────────────────────────────────────────────────
+function buildSystemPrompt(platform, tone) {
   const platforms = {
-    blog: "Write a comprehensive blog post with headline, intro, body sections with ## headers, and conclusion.",
-    instagram: "Write an Instagram caption with emojis, a hook, and 5-10 hashtags at the end.",
-    linkedin: "Write a professional LinkedIn post with a hook and call-to-action.",
-    twitter: "Write a Twitter/X thread starting with 1/, then 2/, 3/ etc. Max 280 chars each.",
+    blog: "Write a comprehensive blog post with a headline, intro, body sections with ## headers, and conclusion.",
+    instagram: "Write an Instagram caption with emojis, a hook, and 5-10 relevant hashtags at the end.",
+    linkedin: "Write a professional LinkedIn post with a compelling hook and call-to-action.",
+    twitter: "Write a Twitter/X thread. Start with 1/, then 2/, 3/ etc. Keep each tweet under 280 chars.",
     email: "Write a marketing email with Subject line, Preview text, body sections, and CTA.",
-    marketing: "Write marketing copy with headline, value proposition, benefits, and CTA.",
+    marketing: "Write marketing copy with headline, value proposition, key benefits, and CTA.",
   };
   const tones = {
     professional: "Use a professional, authoritative tone.",
     casual: "Use a friendly, conversational tone.",
-    persuasive: "Use persuasive language with urgency.",
-    "seo-optimized": "Use SEO best practices with keywords and proper headings.",
+    persuasive: "Use persuasive language with a sense of urgency.",
+    "seo-optimized": "Use SEO best practices with relevant keywords and proper headings.",
   };
-  return `You are an expert content creator.\n${platforms[platform] || platforms.blog}\n${tones[tone] || tones.professional}\nWrite original ready-to-publish content.\n\nRequest: ${userPrompt}`;
+  return `You are an expert content creator.\n${platforms[platform] || platforms.blog}\n${tones[tone] || tones.professional}\nWrite original, ready-to-publish content.`;
 }
 
+// ─── SSE broadcast ────────────────────────────────────────────────────────────
 let sseClients = [];
 function broadcastAnalytics(data) {
   sseClients.forEach((res) => res.write(`data: ${JSON.stringify(data)}\n\n`));
 }
 
+// ─── POST /api/generate — Groq streaming ─────────────────────────────────────
 app.post("/api/generate", requireAuth, async (req, res) => {
   const { prompt, platform = "blog", tone = "professional" } = req.body;
   if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
-  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_api_key_here")
-    return res.status(500).json({ error: "GEMINI_API_KEY is not set in server/.env" });
+  if (!GROQ_KEY) return res.status(500).json({ error: "GROQ_API_KEY is not set in server/.env" });
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
+
   let fullContent = "";
+
   try {
-    console.log(`▶ [user:${req.userId}] Generating ${platform}/${tone}`);
-    const stream = await ai.models.generateContentStream({ model: "gemini-2.5-flash", contents: buildPrompt(platform, tone, prompt) });
-    for await (const chunk of stream) {
-      const text = chunk.text;
-      if (text) { fullContent += text; res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`); }
-    }
-    const titleResult = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Write a short title (max 8 words) for this content. Reply with the title only, no quotes:\n\n${fullContent.substring(0, 500)}`,
+    console.log(`▶ [user:${req.userId}] Groq generating ${platform}/${tone}`);
+
+    // Call Groq with stream: true
+    const groqRes = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GROQ_KEY}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        stream: true,
+        max_tokens: 2048,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: buildSystemPrompt(platform, tone) },
+          { role: "user", content: prompt },
+        ],
+      }),
     });
-    const title = titleResult.text.trim().replace(/["'.]/g, "");
+
+    if (!groqRes.ok) {
+      const errData = await groqRes.json().catch(() => ({}));
+      throw new Error(errData?.error?.message || `Groq API error: ${groqRes.status}`);
+    }
+
+    // Stream chunks to client
+    const reader = groqRes.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const lines = decoder.decode(value, { stream: true }).split("\n");
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const payload = line.slice(6).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const text = parsed.choices?.[0]?.delta?.content;
+          if (text) {
+            fullContent += text;
+            res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`);
+          }
+        } catch { }
+      }
+    }
+
+    // Generate title using Groq (non-streaming)
+    const titleRes = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        max_tokens: 20,
+        messages: [
+          { role: "user", content: `Write a short title (max 8 words) for this content. Reply with ONLY the title, no quotes or explanation:\n\n${fullContent.substring(0, 500)}` },
+        ],
+      }),
+    });
+    const titleData = await titleRes.json();
+    const title = (titleData.choices?.[0]?.message?.content || "Generated Content").trim().replace(/["'.]/g, "");
+
     const wordCount = fullContent.split(/\s+/).filter(Boolean).length;
     const charCount = fullContent.length;
-    const { lastInsertRowid: contentId } = db.insertContent({ title, type: platform, platform, tone, prompt, content: fullContent, word_count: wordCount, char_count: charCount, user_id: req.userId });
+
+    // Save with user_id for isolation
+    const { lastInsertRowid: contentId } = db.insertContent({
+      title, type: platform, platform, tone, prompt,
+      content: fullContent, word_count: wordCount, char_count: charCount,
+      user_id: req.userId,
+    });
     db.insertEvent({ event_type: "generate", content_id: contentId, content_type: platform, platform, word_count: wordCount, user_id: req.userId });
     broadcastAnalytics({ type: "new_content", platform, wordCount, contentId });
+
     res.write(`data: ${JSON.stringify({ type: "done", contentId, title, wordCount, charCount })}\n\n`);
     res.end();
-    console.log(`✓ Saved ID ${contentId}: "${title}"`);
+    console.log(`✓ Saved ID ${contentId}: "${title}" (${wordCount} words)`);
+
   } catch (err) {
     console.error("❌ Generate error:", err.message);
     res.write(`data: ${JSON.stringify({ type: "error", message: err.message })}\n\n`);
@@ -299,68 +360,7 @@ app.post("/api/generate", requireAuth, async (req, res) => {
   }
 });
 
-
-// ── POST /api/generate-image ──────────────────────────────────────────────────
-app.post("/api/generate-image", requireAuth, async (req, res) => {
-  const { prompt, platform = "blog" } = req.body;
-  if (!prompt?.trim()) return res.status(400).json({ error: "Prompt is required" });
-  if (!process.env.GEMINI_API_KEY)
-    return res.status(500).json({ error: "GEMINI_API_KEY not set" });
-
-  const styleMap = {
-    blog: "professional blog hero photo, high quality, realistic",
-    instagram: "vibrant aesthetic instagram photo, colorful, lifestyle",
-    linkedin: "professional business photo, clean corporate",
-    twitter: "bold eye-catching social media image",
-    email: "clean minimal email header banner",
-    marketing: "commercial advertisement photo, bold colors",
-  };
-  const style = styleMap[platform] || "high quality professional photo";
-  const imagePrompt = `${prompt}, ${style}, no text, no watermark, photorealistic`;
-
-  // Try Gemini Imagen first
-  try {
-    const response = await ai.models.generateImages({
-      model: "imagen-3.0-generate-002",
-      prompt: imagePrompt,
-      config: { numberOfImages: 1, outputMimeType: "image/jpeg" },
-    });
-    const imageData = response.generatedImages?.[0]?.image?.imageBytes;
-    if (imageData) {
-      console.log("✓ Imagen generated successfully");
-      return res.json({ image: imageData, mimeType: "image/jpeg", source: "imagen" });
-    }
-  } catch (imagenErr) {
-    console.log("⚠ Imagen not available:", imagenErr.message, "— falling back to Gemini Vision");
-  }
-
-  // Fallback: Use Gemini to describe an image, then fetch from Picsum with a consistent seed
-  try {
-    // Use Gemini to extract the best search keywords for the image
-    const kwResult = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Give me 2-3 single English words (comma separated, no explanation) that best describe a photo for this content: "${prompt}". Example: "mountain,hiking,adventure"`,
-    });
-    const keywords = (kwResult.text || "").trim().replace(/[^a-z0-9,]/gi, "").toLowerCase();
-    console.log("✓ Fallback keywords:", keywords);
-
-    // Fetch image from Picsum as base64 via the server (avoids Android network issues)
-    const seed = Math.abs(prompt.split("").reduce((a, c) => a + c.charCodeAt(0), 0)) % 1000;
-    const imgRes = await fetch(`https://picsum.photos/seed/${seed}/800/450`);
-    if (!imgRes.ok) throw new Error("Picsum fetch failed");
-
-    const arrayBuffer = await imgRes.arrayBuffer();
-    const base64 = Buffer.from(arrayBuffer).toString("base64");
-    const mimeType = imgRes.headers.get("content-type") || "image/jpeg";
-
-    console.log("✓ Picsum fallback image fetched");
-    return res.json({ image: base64, mimeType, source: "picsum" });
-  } catch (fallbackErr) {
-    console.error("❌ All image methods failed:", fallbackErr.message);
-    res.status(500).json({ error: "Image generation failed: " + fallbackErr.message });
-  }
-});
-
+// ─── Content routes ───────────────────────────────────────────────────────────
 app.get("/api/content", requireAuth, (req, res) => {
   const { type, search, limit = 50, offset = 0 } = req.query;
   res.json(db.getContent({ type, search, limit: parseInt(limit), offset: parseInt(offset), userId: req.userId }));
@@ -379,6 +379,7 @@ app.delete("/api/content/:id", requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Analytics ────────────────────────────────────────────────────────────────
 app.get("/api/analytics", requireAuth, (req, res) => {
   res.json(db.getAnalytics(req.userId));
 });
@@ -394,13 +395,14 @@ app.get("/api/analytics/stream", requireAuth, (req, res) => {
   req.on("close", () => { sseClients = sseClients.filter((c) => c !== res); });
 });
 
-app.get("/api/health", (_, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+// ─── Health ───────────────────────────────────────────────────────────────────
+app.get("/api/health", (_, res) => res.json({ status: "ok", ai: "groq", model: GROQ_MODEL, timestamp: new Date().toISOString() }));
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n✅ Backend running on http://localhost:${PORT}`);
-  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_api_key_here")
-    console.log(`⚠️  GEMINI_API_KEY not set in server/.env`);
-  else
-    console.log(`🔑 Gemini key loaded ✓`);
+  console.log(`🤖 AI: Groq (${GROQ_MODEL})`);
+  if (!GROQ_KEY) console.log(`⚠️  GROQ_API_KEY not set in server/.env`);
+  else console.log(`🔑 Groq key loaded ✓`);
   console.log(`🔐 Auth: JWT enabled ✓\n`);
 });
